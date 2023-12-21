@@ -1,23 +1,40 @@
 # main.py
 
-from typing import Annotated, Any
-from fastapi import FastAPI, File, Form, Depends, HTTPException, Request, Body
+import os
+from typing import Any, Optional, List
+from typing_extensions import Annotated
+
+from fastapi import FastAPI, File, Form, Depends, HTTPException, Request, Body, status
+from fastapi.responses import Response
+from pydantic import ConfigDict, BaseModel, Field
+from pydantic.functional_validators import BeforeValidator
+
+from bson import ObjectId
+import motor.motor_asyncio
+from pymongo import ReturnDocument
+
 from io import BytesIO
 import base64
 import tensorflow as tf
 import numpy as np
 from PIL import Image
-import os
-import json
-#import crud, models, schemas
-from database import SessionLocal, engine
-#from sqlalchemy.orm import Session
 import logging
 
 # load pre-trained saved model
 model = tf.keras.models.load_model(f"{os.getcwd()}/saved_model")
 
-app = FastAPI()
+app = FastAPI(
+    title="Tyretext API",
+    summary="Extract image from text and manage car data using this API.",
+)
+
+client = motor.motor_asyncio.AsyncIOMotorClient("mongodb://localhost") #os.environ["MONGODB_URL"])
+db = client.assemblydb
+car_collection = db.get_collection("cars")
+
+# Represents an ObjectId field in the database.
+# It will be represented as a `str` on the model so that it can be serialized to JSON.
+PyObjectId = Annotated[str, BeforeValidator(str)]
 
 def img2txt(file: bytes):
     # Open the image
@@ -49,19 +66,12 @@ def listToString(s):
      # return string
     return str1
 
-# Dependency
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-@app.get("/")
+@app.get("/", tags=["Root"])
 async def root():
     return {"message": "Connection successful!"}
 
-@app.post("/upload_img/")
+# Route for image to text conversion
+@app.post("/upload_img/", tags=["Image to Text"])
 async def accept_img_demo(
     file: Annotated[bytes, File()],
     token: Annotated[str, Form()],
@@ -74,40 +84,200 @@ async def accept_img_demo(
         "received_str": token,
         }
 
-@app.post("/add_platform/")
-async def add_platform(requeststr: Any = Body(None)):
-    with open("platform_db.json", "a") as write_file:
-        write_file.write(requeststr)
-    return {"status": "OK"}
+# Classes and routes for db manipulation
+class Wheel(BaseModel):
+    location: str = Field(...)
+    vin: str = Field(...)
+    make: str = Field(...)
+    size: str = Field(...)
 
-@app.get("/fetch_platformdb/")
-async def fetch_platformdb():
-    with open("platform_db.json", "r") as file:
-        data = file.read()
-    return data
+class CarModel(BaseModel):
+    """
+    Container for a single car record.
+    """
+
+    # The primary key for the CarModel, stored as a `str` on the instance.
+    # This will be aliased to `_id` when sent to MongoDB,
+    # but provided as `id` in the API requests and responses.
+    id: Optional[PyObjectId] = Field(alias="_id", default=None)
+    mod_num: str = Field(...)
+    axle_num: int = Field(...)
+    wheels_data: list[Wheel] = Field(...) # | None = None
+    model_config = ConfigDict(
+        populate_by_name=True,
+        arbitrary_types_allowed=True,
+        json_schema_extra={
+            "example": {
+                "mod_num": "ZXBVNMC",
+                "axle_num": 5,
+                "wheels_data": [
+                    {
+                        "location": "Front Axle 1 LH",
+                        "vin": "CXX123401",
+                        "make": "Diablo",
+                        "size": "35",
+                    },
+                    {
+                        "location": "Front Axle 1 RH",
+                        "vin": "CYY123403",
+                        "make": "Rouge",
+                        "size": "35",
+                    }
+                ],
+            }
+        },
+    )
+
+class UpdateCarModel(BaseModel):
+    """
+    A set of optional updates to be made to a document in the database.
+    """
+
+    mod_num: Optional[str] = None
+    axle_num: Optional[int] = None
+    wheels_data: Optional[list[Wheel]] = None
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        json_encoders={ObjectId: str},
+        json_schema_extra={
+            "example": {
+                "mod_num": "ZXBVNMC",
+                "axle_num": 5,
+                "wheels_data": [
+                    {
+                        "location": "Front Axle 1 LH",
+                        "vin": "CXX123401",
+                        "make": "Diablo",
+                        "size": "35",
+                    },
+                    {
+                        "location": "Front Axle 1 RH",
+                        "vin": "CYY123403",
+                        "make": "Rouge",
+                        "size": "35",
+                    }
+                ],
+            }
+        },
+    )
+
+class CarCollection(BaseModel):
+    """
+    A container holding a list of `CarModel` instances.
+
+    This exists because providing a top-level array in a JSON response can be a [vulnerability](https://haacked.com/archive/2009/06/25/json-hijacking.aspx/)
+    """
+
+    cars: List[CarModel]
+
+@app.post(
+    "/cars/",
+    response_description="Add new car",
+    response_model=CarModel,
+    status_code=status.HTTP_201_CREATED,
+    response_model_by_alias=False,
+    tags=["CRUD"],
+)
+async def create_car(car: CarModel = Body(...)):
+    """
+    Insert a new car record.
+
+    A unique `id` will be created and provided in the response.
+    """
+    new_car = await car_collection.insert_one(
+        car.model_dump(by_alias=True, exclude=["id"])
+    )
+    created_car = await car_collection.find_one(
+        {"_id": new_car.inserted_id}
+    )
+    return created_car
 
 
+@app.get(
+    "/cars/",
+    response_description="List all cars",
+    response_model=CarCollection,
+    response_model_by_alias=False,
+    tags=["CRUD"],
+)
+async def list_cars():
+    """
+    List all of the car data in the database.
 
-"""
-@app.post("/create_vehicle/")
-async def create_vehicle(
-    id: Annotated[str, Form()],
-    model: Annotated[str, Form()],
-    n_axles: Annotated[int, Form()],
-    n_wheels: Annotated[int, Form()],
-    db: Session = Depends(get_db),
-    **wheeldata
-):
-    try:
-        vehicle = models.Vehicle(id, model, n_axles, n_wheels)
-        crud.init_vehicle(db, vehicle)
-        for i in range(n_wheels):
-            crud.update_wheel(id, wheeldata)
-        return {"message": "Vehicle succesfully created!"}
-    except:
-        return {"message": "ERROR: Vehicle creation failed!"}
-"""
+    The response is unpaginated and limited to 1000 results.
+    """
+    return CarCollection(cars=await car_collection.find().to_list(1000))
 
+
+@app.get(
+    "/cars/{id}",
+    response_description="Get a single car",
+    response_model=CarModel,
+    response_model_by_alias=False,
+    tags=["CRUD"],
+)
+async def show_car(id: str):
+    """
+    Get the record for a specific car, looked up by `id`.
+    """
+    if (
+        car := await car_collection.find_one({"_id": ObjectId(id)})
+    ) is not None:
+        return car
+
+    raise HTTPException(status_code=404, detail=f"Car {id} not found")
+
+
+@app.put(
+    "/cars/{id}",
+    response_description="Update a car",
+    response_model=CarModel,
+    response_model_by_alias=False,
+    tags=["CRUD"],
+)
+async def update_car(id: str, car: UpdateCarModel = Body(...)):
+    """
+    Update individual fields of an existing car record.
+
+    Only the provided fields will be updated.
+    Any missing or `null` fields will be ignored.
+    """
+    car = {
+        k: v for k, v in car.model_dump(by_alias=True).items() if v is not None
+    }
+
+    if len(car) >= 1:
+        update_result = await car_collection.find_one_and_update(
+            {"_id": ObjectId(id)},
+            {"$set": car},
+            return_document=ReturnDocument.AFTER,
+        )
+        if update_result is not None:
+            return update_result
+        else:
+            raise HTTPException(status_code=404, detail=f"Car {id} not found")
+
+    # The update is empty, but we should still return the matching document:
+    if (existing_car := await car_collection.find_one({"_id": id})) is not None:
+        return existing_car
+
+    raise HTTPException(status_code=404, detail=f"Car {id} not found")
+
+
+@app.delete("/cars/{id}", response_description="Delete a car", tags=["CRUD"],)
+async def delete_car(id: str):
+    """
+    Remove a single car record from the database.
+    """
+    delete_result = await car_collection.delete_one({"_id": ObjectId(id)})
+
+    if delete_result.deleted_count == 1:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    raise HTTPException(status_code=404, detail=f"Car {id} not found")
+
+
+# Routes for testing
 async def print_request(request):
     print(f'request header       : {dict(request.headers.items())}' )
     print(f'request query params : {dict(request.query_params.items())}')  
@@ -117,7 +287,7 @@ async def print_request(request):
         # could not parse json
         print(f'request body         : {await request.body()}')
 
-@app.post("/test/")
+@app.post("/test/", tags=["Test"])
 async def test_request(request: Request):
     try:
         await print_request(request)
@@ -126,7 +296,7 @@ async def test_request(request: Request):
         logging.error(f'could not print REQUEST: {err}')
         return {"status": "ERR"}
     
-@app.post("/testsaveb64/")
+@app.post("/testsaveb64/", tags=["Test"])
 async def input_request_b64(
     fileb64: Annotated[str, Form()],
     token: Annotated[str, Form()]
@@ -135,7 +305,7 @@ async def input_request_b64(
         save_file.write(base64.b64decode(fileb64))
     return token
 
-@app.post("/testsave/")
+@app.post("/testsave/", tags=["Test"])
 async def input_request(
     file: Annotated[bytes, File()],
     token: Annotated[str, Form()],
@@ -143,37 +313,3 @@ async def input_request(
     with open('file_saved', 'wb') as save_file:
         save_file.write(file)
     return token
-
-"""
-@app.post("/uploadVIN/")
-async def accept_img_with_identifiers(
-    file: Annotated[bytes, File()],
-    vehicle_id: Annotated[str, Form()],
-    wheel_id: Annotated[str, Form()],
-):
-    txt_out = img2txt(file)
-
-    with open('image.jpg', 'wb') as save_file:
-        save_file.write(file)
-
-    #crud.update_vin(txt_out, vehicle_id, wheel_id)
-
-    return {
-        "file_size": len(file),
-        "output": txt_out,
-        "message": "Successful",
-        }
-"""
-
-"""
-@app.get("/view_vehicles/")
-async def view_vehicles_db_request(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    vehicleModels = crud.get_vehicles(db, skip=skip, limit=limit)
-    return vehicleModels
-
-@app.get("/view_wheel_data/{vehicle_id}", response_model=schemas.VehicleModel)
-def read_vehicle_wheel_data(vehicle_id: int, db: Session = Depends(get_db)):
-    db_vehicle = crud.get_vehicle(db, vehicle_id=vehicle_id)
-    if db_vehicle is None:
-        raise HTTPException(status_code=404, detail="VehicleModel not found")
-    return db_vehicle"""
