@@ -4,10 +4,11 @@ import os
 from typing import Any, Optional, List
 from typing_extensions import Annotated
 
-from fastapi import FastAPI, File, Form, Depends, HTTPException, Request, Body, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, Body, status, BackgroundTasks
 from fastapi.responses import Response
 from pydantic import ConfigDict, BaseModel, Field
 from pydantic.functional_validators import BeforeValidator
+from sse_starlette import EventSourceResponse
 
 from bson import ObjectId
 import motor.motor_asyncio
@@ -19,15 +20,19 @@ import tensorflow as tf
 import numpy as np
 from PIL import Image
 import logging
+import time
+import asyncio
 
 # load pre-trained saved model
 model = tf.keras.models.load_model(f"{os.getcwd()}/saved_model")
 
+# FastAPI setup
 app = FastAPI(
     title="Tyretext API",
     summary="Extract image from text and manage car data using this API.",
 )
 
+# MongoDB setup
 client = motor.motor_asyncio.AsyncIOMotorClient("mongodb://localhost") #os.environ["MONGODB_URL"])
 db = client.assemblydb
 car_collection = db.get_collection("cars")
@@ -36,7 +41,10 @@ car_collection = db.get_collection("cars")
 # It will be represented as a `str` on the model so that it can be serialized to JSON.
 PyObjectId = Annotated[str, BeforeValidator(str)]
 
-def img2txt(file: bytes):
+# DB update flag setup
+db_updated = 1
+
+async def img2txt(file: bytes):
     # Open the image
     image = Image.open(BytesIO(file))
     # Resize the image to 32x32 pixels
@@ -56,7 +64,7 @@ def img2txt(file: bytes):
     string_form = listToString(list_form)
     return string_form
 
-def listToString(s):
+async def listToString(s):
      # initialize an empty string
     str1 = ""
      # traverse in the string
@@ -172,7 +180,7 @@ class CarCollection(BaseModel):
 
 @app.post(
     "/cars/",
-    response_description="Add new car",
+    response_description="Add new car record",
     response_model=CarModel,
     status_code=status.HTTP_201_CREATED,
     response_model_by_alias=False,
@@ -190,12 +198,17 @@ async def create_car(car: CarModel = Body(...)):
     created_car = await car_collection.find_one(
         {"_id": new_car.inserted_id}
     )
+
+    # Set db_updated flag
+    global db_updated
+    db_updated = 1
+
     return created_car
 
 
 @app.get(
     "/cars/",
-    response_description="List all cars",
+    response_description="List all car records",
     response_model=CarCollection,
     response_model_by_alias=False,
     tags=["CRUD"],
@@ -211,7 +224,7 @@ async def list_cars():
 
 @app.get(
     "/cars/{id}",
-    response_description="Get a single car",
+    response_description="Get a single car record",
     response_model=CarModel,
     response_model_by_alias=False,
     tags=["CRUD"],
@@ -230,7 +243,7 @@ async def show_car(id: str):
 
 @app.put(
     "/cars/{id}",
-    response_description="Update a car",
+    response_description="Update a car record",
     response_model=CarModel,
     response_model_by_alias=False,
     tags=["CRUD"],
@@ -253,6 +266,11 @@ async def update_car(id: str, car: UpdateCarModel = Body(...)):
             return_document=ReturnDocument.AFTER,
         )
         if update_result is not None:
+            
+            # Set db_updated flag
+            global db_updated
+            db_updated = 1
+
             return update_result
         else:
             raise HTTPException(status_code=404, detail=f"Car {id} not found")
@@ -264,7 +282,7 @@ async def update_car(id: str, car: UpdateCarModel = Body(...)):
     raise HTTPException(status_code=404, detail=f"Car {id} not found")
 
 
-@app.delete("/cars/{id}", response_description="Delete a car", tags=["CRUD"],)
+@app.delete("/cars/{id}", response_description="Delete a car record", tags=["CRUD"],)
 async def delete_car(id: str):
     """
     Remove a single car record from the database.
@@ -272,10 +290,45 @@ async def delete_car(id: str):
     delete_result = await car_collection.delete_one({"_id": ObjectId(id)})
 
     if delete_result.deleted_count == 1:
+        
+        # Set db_updated flag
+        global db_updated
+        db_updated = 1
+
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     raise HTTPException(status_code=404, detail=f"Car {id} not found")
 
+# Route for database update notifications
+@app.get("/updates/", tags=["Updates"])
+async def update_notify(request: Request):
+      
+    async def check_db():
+        global db_updated
+        i = 0
+        
+        while True:
+            # If client closes connection, stop sending events
+            if await request.is_disconnected():
+                break
+            
+            if db_updated:
+                # the contents of the new event
+                i += 1
+                db_updated = 0
+                msg = "The database has been updated at %s." % time.strftime("%H:%M:%S", time.localtime())
+                # send the event to the client with yield: EventSourceResponse requires the
+                # event be returned as a dictionary, where keys (id, data, and event)
+                # correspond to SSE properties
+                yield {
+                    "id": i,
+                    "data": msg,
+                    "event": "DB_UPDATED"
+                }
+    
+            await asyncio.sleep(1)
+
+    return EventSourceResponse(check_db())
 
 # Routes for testing
 async def print_request(request):
